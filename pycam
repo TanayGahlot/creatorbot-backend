@@ -109,7 +109,7 @@ class Opts:
         self.support_grid_distance_x= state['support_grid_distance_x']
         self.parallel_processes= state['parallel_processes']
         self.support_distributed_distance= state['support_distributed_distance']
-        self.quiet= False
+        self.quiet= True
         self.process_engrave_offset= state['process_engrave_offset']
         self.gcode_no_start_stop_spindle= state['gcode_no_start_stop_spindle']
 
