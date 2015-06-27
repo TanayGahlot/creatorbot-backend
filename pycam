@@ -511,7 +511,9 @@ if __name__ == "__main__":
     # Otherwise we will see a warning regarding an invalid argument called
     # "--multiprocessing-fork". This problem can be triggered on single-core
     # systems with these arguments: "--enable-server --server-auth-key foo".
-    opts = Opts(json.loads(raw_input()))
+    text = raw_input()
+    text = text.replace("\\\\", "\\")
+    opts = Opts(json.loads(text))
     try:
         if opts.profile_destination:
             import cProfile
