@@ -860,7 +860,6 @@ def import_model(filename, color_as_height=False, fonts_cache=None,
 
     result = DXFParser(infile, color_as_height=color_as_height,
             fonts_cache=fonts_cache, callback=callback)
-
     model_data = result.get_model()
     lines = model_data["lines"]
     triangles = model_data["triangles"]

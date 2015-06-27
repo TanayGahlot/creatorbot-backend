@@ -170,7 +170,7 @@ def import_model(svg_text, program_locations=None, unit="mm", callback=None,
         log.warn("SVGImporter: load model operation was cancelled")
         result = None
     else:
-        log.info("Successfully converted EPS file to DXF file")
+        log.info("Converting EPS file to DXF file")
         result = pycam.Importers.DXFImporter.import_model(dxf_file_name,
                 unit=unit, color_as_height=True, callback=callback)
     # always remove the dxf file
