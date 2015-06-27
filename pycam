@@ -1,0 +1,532 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+$Id: pycam 1090 2011-06-13 02:55:50Z sumpfralle $
+
+Copyright 2010 Lars Kruse <devel@sumpfralle.de>
+Copyright 2008-2009 Lode Leroy
+
+This file is part of PyCAM.
+
+PyCAM is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+PyCAM is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with PyCAM.  If not, see <http://www.gnu.org/licenses/>.
+"""
+
+# extend the PYTHONPATH to include the "src" directory
+import sys
+import os
+import json 
+BASE_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(BASE_DIR, "src"))
+
+# register the glut32.dll manually for the pyinstaller standalone executable
+if hasattr(sys, "frozen") and sys.frozen and "_MEIPASS2" in os.environ:
+    from ctypes import windll
+    windll[os.path.join(os.path.normpath(os.environ["_MEIPASS2"]),
+            "glut32.dll")]
+
+import pycam.Gui.common as GuiCommon
+import pycam.Gui.Settings
+import pycam.Gui.Console
+import pycam.Importers.TestModel
+import pycam.Importers
+import pycam.Exporters.GCodeExporter
+import pycam.Toolpath.Generator
+import pycam.Utils.threading
+import pycam.Utils
+from pycam.Toolpath import Bounds, Toolpath
+from pycam import VERSION
+import pycam.Utils.log
+from optparse import OptionParser
+import socket
+import warnings
+import ast
+import logging
+import time
+# we need to import gtk.Warning to silence these warnings later
+#import gtk
+
+
+#creating the class for type opts
+class Opts:
+    def __init__(self, state):
+        self.profile_destination= state['profile_destination']
+        self.export_gcode= True
+        self.process_material_allowance= state['process_material_allowance']
+        self.gcode_motion_tolerance= state['gcode_motion_tolerance']
+        self.gcode_minimum_step= state['gcode_minimum_step']
+        self.disable_psyco= True
+        self.support_distributed_minimum= state['support_distributed_minimum']
+        self.support_grid_distance_y= state['support_grid_distance_y']
+        self.remote_server= None
+        self.process_milling_style= state['process_milling_style']
+        self.tool_shape= state['tool_shape']
+        self.enable_server= False
+        self.bounds_lower= state['bounds_lower']
+        self.process_overlap_percent= state['process_overlap_percent']
+        self.tool_spindle_speed= state['tool_spindle_speed']
+        self.tool_torus_diameter= state['tool_torus_diameter']
+        self.external_program_pstoedit= ''
+        self.gcode_naive_tolerance= state['gcode_naive_tolerance']
+        self.support_profile_height= state['support_profile_height']
+        self.process_path_strategy= 'engrave'
+        self.server_authkey= state['server_authkey']
+        self.start_server= state['start_server']
+        self.support_distributed_length= state['support_distributed_length']
+        self.process_path_direction= state['process_path_direction']
+        self.svg_text= state['svg_text']
+        self.debug= state['debug']
+        self.collision_engine= state['collision_engine']
+        self.process_step_down= state['process_step_down']
+        self.tool_diameter= state['tool_diameter']
+        self.boundary_mode= state['boundary_mode']
+        self.support_grid_offset_x= state['support_grid_offset_x']
+        self.support_grid_offset_y= state['support_grid_offset_y']
+        self.show_version= state['show_version']
+        self.support_type= state['support_type']
+        self.bounds_upper= state['bounds_upper']
+        self.unit_size= state['unit_size']
+        self.progress= state['progress']
+        self.export_task_config= state['export_task_config']
+        self.tool_id= state['tool_id']
+        self.config_file= state['config_file']
+        self.tool_feedrate= state['tool_feedrate']
+        self.support_profile_thickness= state['support_profile_thickness']
+        self.external_program_inkscape= state['external_program_inkscape']
+        self.safety_height= state['safety_height']
+        self.bounds_type= state['bounds_type']
+        self.gcode_path_mode= state['gcode_path_mode']
+        self.support_grid_distance_x= state['support_grid_distance_x']
+        self.parallel_processes= state['parallel_processes']
+        self.support_distributed_distance= state['support_distributed_distance']
+        self.quiet= True
+        self.process_engrave_offset= state['process_engrave_offset']
+        self.gcode_no_start_stop_spindle= state['gcode_no_start_stop_spindle']
+
+
+
+# we need the multiprocessing exception for remote connections
+try:
+    import multiprocessing
+except ImportError:
+    class multiprocessing(object):
+        # use an arbitrary other Exception
+        AuthenticationError = socket.error
+
+
+# The installer for PyODE does not add the required PATH variable.
+if pycam.Utils.get_platform() == pycam.Utils.PLATFORM_WINDOWS:
+    os.environ["PATH"] = os.environ.get("PATH", "") + os.path.pathsep + sys.exec_prefix
+# The GtkGLExt installer does not add the required PATH variable. 
+if pycam.Utils.get_platform() == pycam.Utils.PLATFORM_WINDOWS:
+    import _winreg
+    path = None
+    try:
+        reg = _winreg.ConnectRegistry(None, _winreg.HKEY_LOCAL_MACHINE)
+        regkey = _winreg.OpenKey(reg, r"SOFTWARE\GtkGLExt\1.0\Runtime")
+    except WindowsError:
+        regkey = None
+    index = 0
+    while regkey:
+        try:
+            key, value = _winreg.EnumValue(regkey, index)[:2]
+        except WindowsError:
+            # no more items left
+            break
+        if key == "Path":
+            path = os.path.join(str(value), "bin")
+            break
+        index += 1
+    if path:
+        os.environ["PATH"] = os.environ.get("PATH", "") + os.path.pathsep + path
+
+
+log = pycam.Utils.log.get_logger()
+
+EXAMPLE_MODEL_LOCATIONS = [
+        os.path.join(BASE_DIR, "samples"),
+        os.path.join(sys.prefix, "share", "pycam", "samples"),
+        os.path.join(sys.prefix, "local", "share", "pycam", "samples"),
+        os.path.join("usr", "share", "pycam", "samples")]
+# for pyinstaller (windows distribution)
+if "_MEIPASS2" in os.environ:
+    EXAMPLE_MODEL_LOCATIONS.insert(0, os.path.join(os.path.normpath(
+            os.environ["_MEIPASS2"]), "samples"))
+DEFAULT_MODEL_FILE = "pycam-textbox.stl"
+EXIT_CODES = {"ok": 0, "requirements": 1, "load_model_failed": 2,
+        "write_output_failed": 3, "parsing_failed": 4,
+        "server_without_password": 5, "connection_error": 6}
+
+
+def show_gui(inputfile=None, task_settings_file=None):
+    deps_gtk = GuiCommon.requirements_details_gtk()
+    report_gtk = GuiCommon.get_dependency_report(deps_gtk, prefix="\t")
+    if GuiCommon.check_dependencies(deps_gtk):
+        from pycam.Gui.Project import ProjectGui
+        gui_class = ProjectGui
+    else:
+        full_report = []
+        full_report.append("PyCAM dependency problem")
+        full_report.append("Error: Failed to load the GTK interface.")
+        full_report.append("Details:")
+        full_report.append(report_gtk)
+        full_report.append("")
+        full_report.append("Detailed list of requirements: %s" % \
+                GuiCommon.REQUIREMENTS_LINK)
+        log.critical(os.linesep.join(full_report))
+        return EXIT_CODES["requirements"]
+
+    gui = gui_class()
+
+    # load the given model or the default
+    if not inputfile:
+        default_model = get_default_model()
+        if isinstance(default_model, (basestring, pycam.Utils.URIHandler)):
+            gui.load_model_file(filename=default_model, store_filename=False)
+        else:
+            gui.load_model(default_model)
+    else:
+        gui.load_model_file(filename=inputfile)
+
+    # load task settings file
+    if not task_settings_file is None:
+        gui.open_task_settings_file(task_settings_file)
+
+    # tell the GUI to empty the "undo" queue
+    gui.finish_startup()
+
+    # open the GUI
+    gui.mainloop()
+    # no error -> return no error code
+    return None
+
+
+def get_default_model():
+    """ return a filename or a Model instance """
+    # try to load the default model file ("pycam" logo)
+    for inputdir in EXAMPLE_MODEL_LOCATIONS:
+        inputfile = os.path.join(inputdir, DEFAULT_MODEL_FILE)
+        if os.path.isfile(inputfile):
+            return inputfile
+    else:
+        # fall back to the simple test model
+        log.warn("Failed to find the default model (%s) in the " \
+                "following locations: %s" % (DEFAULT_MODEL_FILE,
+                        ", ".join(EXAMPLE_MODEL_LOCATIONS)))
+        return pycam.Importers.TestModel.get_test_model()
+
+def load_model_file(svg_text, program_locations, unit=None):
+    model = pycam.Importers.SVGImporter.import_model(svg_text, program_locations=program_locations, unit=unit)
+    return model
+
+def get_output_handler(destination):
+    if destination == "-":
+        handler = sys.stdout
+        closer = lambda: None
+    else:
+        # support paths with a tilde (~)
+        destination = os.path.expanduser(destination)
+        try:
+            handler = open(destination, "w")
+        except IOError, err_msg:
+            log.error("Failed to open output file (%s) for writing: %s" \
+                    % (destination, err_msg))
+            return None, None
+        closer = handler.close
+    return (handler, closer)
+
+def execute(opts, pycam):
+    # try to change the process name
+    pycam.Utils.setproctitle("pycam")
+
+   
+    if opts.debug:
+        log.setLevel(logging.DEBUG)
+    elif opts.quiet:
+        log.setLevel(logging.WARNING)
+        # disable the progress bar
+        opts.progress = "none"
+        # silence all warnings
+        warnings.filterwarnings("ignore")
+    else:
+        # silence gtk warnings
+        try:
+            import gtk
+            warnings.filterwarnings("ignore", category=gtk.Warning)
+        except ImportError:
+            pass
+
+    # show version and exit
+    if opts.show_version:
+        if opts.quiet:
+            # print only the bare version number
+            print VERSION
+        else:
+            text = '''PyCAM %s
+Copyright (C) 2008-2010 Lode Leroy
+Copyright (C) 2010-2011 Lars Kruse
+
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>.
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.''' % VERSION
+            print text
+        return EXIT_CODES["ok"]
+
+    if not opts.disable_psyco:
+        try:
+            import psyco
+            psyco.full()
+            log.info("Psyco enabled")
+        except ImportError:
+            log.info("Psyco is not available (performance will probably " \
+                    + "suffer slightly)")
+    else:
+        log.info("Psyco was disabled via the commandline")
+
+    # check if server-auth-key is given -> this is mandatory for server mode
+    if (opts.enable_server or opts.start_server) and not opts.server_authkey:
+        print "You need to supply a shared secret for server mode. " \
+                + "This is supposed to prevent you from exposing your host " \
+                + "to remote access without authentication.\n" \
+                + "Please add the '--server-auth-key' argument followed by " \
+                + "a shared secret password."
+        return EXIT_CODES["server_without_password"]
+
+    # initialize multiprocessing
+    try:
+        if opts.start_server:
+            pycam.Utils.threading.init_threading(opts.parallel_processes,
+                    remote=opts.remote_server, run_server=True,
+                    server_credentials=opts.server_authkey)
+            pycam.Utils.threading.cleanup()
+            return EXIT_CODES["ok"]
+        else:
+            pycam.Utils.threading.init_threading(opts.parallel_processes,
+                    enable_server=opts.enable_server, remote=opts.remote_server,
+                    server_credentials=opts.server_authkey)
+    except socket.error, err_msg:
+        log.error("Failed to connect to remote server: %s" % err_msg)
+        return EXIT_CODES["connection_error"]
+    except multiprocessing.AuthenticationError, err_msg:
+        log.error("The remote server rejected your authentication key: %s" \
+                % err_msg)
+        return EXIT_CODES["connection_error"]
+
+    # initialize the progress bar
+    progress_styles = {"none": pycam.Gui.Console.ConsoleProgressBar.STYLE_NONE,
+            "text": pycam.Gui.Console.ConsoleProgressBar.STYLE_TEXT,
+            "bar": pycam.Gui.Console.ConsoleProgressBar.STYLE_BAR,
+            "dot": pycam.Gui.Console.ConsoleProgressBar.STYLE_DOT,
+    }
+    progress_bar = pycam.Gui.Console.ConsoleProgressBar(sys.stdout,
+            progress_styles[opts.progress])
+
+    if opts.config_file:
+        opts.config_file = os.path.expanduser(opts.config_file)
+
+    if not opts.export_gcode and not opts.export_task_config:
+        result = show_gui(inputfile, opts.config_file)
+        if not result is None:
+            # deliver the error code to our caller
+            return result
+    else:
+        # generate toolpath
+        tps = pycam.Gui.Settings.ToolpathSettings()
+        tool_shape = {"cylindrical": "CylindricalCutter",
+                "spherical": "SphericalCutter",
+                "toroidal": "ToroidalCutter",
+            }[opts.tool_shape]
+        tps.set_tool(opts.tool_id, tool_shape, 0.5 * opts.tool_diameter,
+                0.5 * opts.tool_torus_diameter, opts.tool_spindle_speed,
+                opts.tool_feedrate)
+        if opts.support_type == "grid":
+            tps.set_support_grid(opts.support_grid_distance_x,
+                    opts.support_grid_distance_y,
+                    opts.support_profile_thickness, opts.support_profile_height,
+                    opts.support_grid_offset_x, opts.support_grid_offset_y)
+        elif opts.support_type in ("distributed-edges", "distributed-corners"):
+            start_at_corners = (opts.support_type == "distributed-corners")
+            tps.set_support_distributed(opts.support_distributed_distance,
+                    opts.support_distributed_minimum,
+                    opts.support_profile_thickness, opts.support_profile_height,
+                    opts.support_distributed_length,
+                    start_at_corners=start_at_corners)
+        elif opts.support_type == "none":
+            pass
+        else:
+            raise NotImplementedError, "Invalid support type specified: %s" % \
+                    opts.support_type
+        if opts.collision_engine == "ode":
+            tps.set_calculation_backend("ODE")
+        tps.set_unit_size(opts.unit_size)
+        path_generator, postprocessor = {
+                "layer": ("PushCutter", "SimpleCutter"),
+                "contour-follow": ("ContourFollow", "SimpleCutter"),
+                "contour-polygon": ("PushCutter", "ContourCutter"),
+                "surface": ("DropCutter", "PathAccumulator"),
+                "engrave": ("EngraveCutter", "SimpleCutter"),
+            }[opts.process_path_strategy]
+        tps.set_process_settings(path_generator, postprocessor,
+                opts.process_path_direction,
+                material_allowance=opts.process_material_allowance,
+                overlap_percent=opts.process_overlap_percent,
+                step_down=opts.process_step_down,
+                engrave_offset=opts.process_engrave_offset,
+                milling_style=opts.process_milling_style)
+        # set locations of external programs
+        program_locations = {}
+        if opts.external_program_inkscape:
+            program_locations["inkscape"] = opts.external_program_inkscape
+        if opts.external_program_pstoedit:
+            program_locations["pstoedit"] = opts.external_program_pstoedit
+        # load the model
+        
+        model = load_model_file(opts.svg_text,
+                    program_locations=program_locations, unit=opts.unit_size)
+        if model is None:
+            # something went wrong - we quit
+            return EXIT_CODES["load_model_failed"]
+        # calculate the processing boundary
+        bounds = Bounds()
+        bounds.set_reference(model.get_bounds())
+        # set the bounds type and let the default bounding box match the model
+        if opts.bounds_type == "relative-margin":
+            bounds.set_type(Bounds.TYPE_RELATIVE_MARGIN)
+            bounds_default_low = (0, 0, 0)
+            bounds_default_high = (0, 0, 0)
+        elif opts.bounds_type == "fixed-margin":
+            bounds.set_type(Bounds.TYPE_FIXED_MARGIN)
+            bounds_default_low = (0, 0, 0)
+            bounds_default_high = (0, 0, 0)
+        else:
+            # custom boundary setting
+            bounds.set_type(Bounds.TYPE_CUSTOM)
+            bounds_default_low = (model.minx, model.miny, model.minz)
+            bounds_default_high = (model.maxx, model.maxy, model.maxz)
+        # TODO: use the optparse conversion callback instead
+        def parse_triple_float(text):
+            nums = text.split(",")
+            if len(nums) != 3:
+                return None
+            result = []
+            for num in nums:
+                try:
+                    result.append(float(num))
+                except ValueError:
+                    if num == "":
+                        result.append(0.0)
+                    else:
+                        return None
+            return result
+        bounds_lower_nums = parse_triple_float(opts.bounds_lower)
+        if opts.bounds_lower and not bounds_lower_nums:
+            print "Failed to parse the lower boundary limit: %s" \
+                    % opts.bounds_lower
+            return EXIT_CODES["parsing_failed"]
+        bounds_upper_nums = parse_triple_float(opts.bounds_upper)
+        if opts.bounds_upper and not bounds_upper_nums:
+            print "Failed to parse the upper boundary limit: %s" \
+                    % opts.bounds_upper
+            return EXIT_CODES["parsing_failed"]
+        if bounds_lower_nums is None:
+            bounds_lower_nums = bounds_default_low
+        if bounds_upper_nums is None:
+            bounds_upper_nums = bounds_default_high
+        # both lower and upper bounds were specified
+        bounds.set_bounds(bounds_lower_nums, bounds_upper_nums)
+        # adjust the bounding box according to the "boundary_mode"
+        if opts.boundary_mode == "along":
+            offset = (0, 0, 0)
+        elif opts.boundary_mode == "inside":
+            offset = (-0.5 * opts.tool_diameter, -0.5 * opts.tool_diameter, 0)
+        else:
+            # "outside"
+            offset = (0.5 * opts.tool_diameter, 0.5 * opts.tool_diameter, 0)
+        process_bounds = Bounds(Bounds.TYPE_FIXED_MARGIN, offset, offset)
+        process_bounds.set_reference(bounds)
+        tps.set_bounds(process_bounds)
+        if opts.export_gcode:
+            # generate the toolpath
+            start_time = time.time()
+            toolpath = pycam.Toolpath.Generator.generate_toolpath_from_settings(
+                    model, tps, callback=progress_bar.update)
+            progress_bar.finish()
+            log.info("Toolpath generation time: %f" \
+                    % (time.time() - start_time))
+            # write result
+            if isinstance(toolpath, basestring):
+                # an error occoured
+                log.error(toolpath)
+            else:
+                description = "Toolpath generated via PyCAM v%s" % VERSION
+                tp_obj = Toolpath(toolpath, description, tps)
+                handler, closer = get_output_handler("-")
+                if handler is None:
+                    return EXIT_CODES["write_output_failed"]
+                generator = pycam.Exporters.GCodeExporter.GCodeGenerator(
+                        handler, metric_units = (opts.unit_size == "mm"),
+                        safety_height=opts.safety_height,
+                        toggle_spindle_status=opts.gcode_no_start_stop_spindle,
+                        minimum_steps=[opts.gcode_minimum_step])
+                generator.set_speed(opts.tool_feedrate, opts.tool_spindle_speed)
+                path_mode = opts.gcode_path_mode
+                PATH_MODES = pycam.Exporters.GCodeExporter.PATH_MODES
+                if (path_mode == "continuous") \
+                        and (not opts.gcode_motion_tolerance is None):
+                    if opts.gcode_naive_tolerance == 0:
+                        naive_tolerance = None
+                    else:
+                        naive_tolerance = opts.gcode_naive_tolerance
+                    generator.set_path_mode(PATH_MODES["continuous"],
+                            opts.gcode_motion_tolerance, naive_tolerance)
+                else:
+                    generator.set_path_mode(PATH_MODES[opts.gcode_path_mode])
+                generator.add_moves(tp_obj.get_moves(opts.safety_height),
+                        comment=tp_obj.get_meta_data())
+                generator.finish()
+                closer()
+        if opts.export_task_config:
+            handler, closer = get_output_handler(opts.export_task_config)
+            if handler is None:
+                return EXIT_CODES["write_output_failed"]
+            print >> handler, tps.get_string()
+            closer()
+    # no error -> don't return a specific exit code
+    return None
+
+
+# define the commandline interface
+if __name__ == "__main__":
+    # The PyInstaller standalone executable requires this "freeze_support" call.
+    # Otherwise we will see a warning regarding an invalid argument called
+    # "--multiprocessing-fork". This problem can be triggered on single-core
+    # systems with these arguments: "--enable-server --server-auth-key foo".
+    opts = Opts(json.loads(raw_input()))
+    try:
+        if opts.profile_destination:
+            import cProfile
+            exit_code = cProfile.run('execute(opts, args, pycam)',
+                    opts.profile_destination)
+        else:
+            # We need to add the parameter "pycam" to avoid weeeeird namespace
+            # issues. Any idea how to fix this?
+            exit_code = execute(opts, pycam)
+    except KeyboardInterrupt:
+        log.info("Quit requested")
+        exit_code = None
+    pycam.Utils.threading.cleanup()
+    if not exit_code is None:
+        sys.exit(exit_code)
+    else:
+        sys.exit(EXIT_CODES["ok"])
+
